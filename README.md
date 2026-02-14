@@ -41,3 +41,9 @@ rex user@host /var/log
 
 - SSH auth is delegated to system `ssh` (keys, agent, passwords, and `~/.ssh/config`).
 - Target platforms: macOS and Linux.
+
+## Smoke Test
+
+```bash
+./scripts/smoke.sh
+```

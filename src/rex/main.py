@@ -16,6 +16,10 @@ from pathlib import PurePosixPath
 from typing import List
 
 
+def build_remote_sh_command(command: str) -> str:
+    return f"sh -lc {shlex.quote(command)}"
+
+
 @dataclass
 class RemoteEntry:
     name: str
@@ -62,7 +66,7 @@ class RexApp:
 
     def _run_ssh(self, command: str, timeout: int = 15) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            ["ssh", self.host, "sh", "-lc", command],
+            ["ssh", self.host, build_remote_sh_command(command)],
             check=False,
             capture_output=True,
             text=True,
@@ -137,18 +141,24 @@ class RexApp:
         if self._change_directory(target):
             return
 
+        self.message = f"Not a directory: {entry.name}. Opening file."
         self._open_file(entry.name)
 
     def _change_directory(self, target_path: str) -> bool:
+        old_cwd = self.cwd
         resolved_cwd, parsed, err = self._list_remote_dir(target_path)
         if err is not None or parsed is None or resolved_cwd is None:
+            self.message = err or "Failed to change directory"
             return False
 
         self.cwd = resolved_cwd
         self.entries = parsed
         self.selected = 0
         self.top_index = 0
-        self.message = f"Loaded {len(parsed)-1} entries"
+        if old_cwd != self.cwd:
+            self.message = f"Entered {self.cwd} ({len(parsed)-1} entries)"
+        else:
+            self.message = f"Staying in {self.cwd} ({len(parsed)-1} entries)"
         return True
 
     def _open_file(self, filename: str) -> None:
@@ -168,7 +178,7 @@ class RexApp:
         curses.def_prog_mode()
         curses.endwin()
         try:
-            subprocess.run(["ssh", "-t", self.host, "sh", "-lc", remote_command], check=False)
+            subprocess.run(["ssh", "-t", self.host, build_remote_sh_command(remote_command)], check=False)
         finally:
             curses.reset_prog_mode()
             curses.curs_set(0)
@@ -215,7 +225,7 @@ class RexApp:
         if pid == 0:
             shell = os.environ.get("SHELL", "/bin/sh")
             cmd = f"cd -- {shlex.quote(self.cwd)} && exec $SHELL -l"
-            os.execvp("ssh", ["ssh", "-tt", self.host, "sh", "-lc", cmd])
+            os.execvp("ssh", ["ssh", "-tt", self.host, build_remote_sh_command(cmd)])
 
         self.shell_pid = pid
         self.shell_fd = fd
@@ -313,6 +323,10 @@ class RexApp:
             return True
 
         if self.focus == "shell":
+            if key in (curses.KEY_ENTER, 10, 13):
+                self.message = "Enter sent to shell (shell focus). Press TAB/b for browser focus."
+                self._send_to_shell(key)
+                return True
             if key in (ord("r"), ord("R")):
                 self._restart_shell()
                 self.message = "Shell restarted"
