@@ -7,6 +7,7 @@ import fcntl
 import locale
 import os
 import pty
+import re
 import select
 import shlex
 import signal
@@ -42,12 +43,22 @@ class RexApp:
         self.shell_lines: List[str] = []
         self.max_shell_lines = 2000
         self._shell_partial = ""
+        self._pair_cache: dict[tuple[int, int], int] = {}
+        self._next_pair = 1
+        self._supports_color = False
 
     def run(self) -> None:
         curses.curs_set(0)
         self.stdscr.nodelay(True)
         self.stdscr.timeout(50)
         self.stdscr.keypad(True)
+        if curses.has_colors():
+            curses.start_color()
+            try:
+                curses.use_default_colors()
+            except curses.error:
+                pass
+            self._supports_color = True
 
         self._start_shell()
         self._reload_entries()
@@ -277,13 +288,115 @@ class RexApp:
             self._append_shell_data(data.decode("utf-8", errors="replace"))
 
     def _append_shell_data(self, text: str) -> None:
-        data = self._shell_partial + text
+        data = self._sanitize_shell_text(self._shell_partial + text)
         parts = data.split("\n")
         self._shell_partial = parts.pop() if parts else ""
         self.shell_lines.extend(parts)
 
         if len(self.shell_lines) > self.max_shell_lines:
             self.shell_lines = self.shell_lines[-self.max_shell_lines :]
+
+    def _sanitize_shell_text(self, text: str) -> str:
+        # Keep CSI for SGR rendering, but remove OSC sequences.
+        text = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", text)
+        # Normalize CRLF and treat bare CR as line overwrite boundary.
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        return text
+
+    def _pair_for(self, fg: int, bg: int) -> int:
+        if not self._supports_color:
+            return 0
+        key = (fg, bg)
+        if key in self._pair_cache:
+            return self._pair_cache[key]
+        if self._next_pair >= curses.COLOR_PAIRS:
+            return 0
+        pair_id = self._next_pair
+        self._next_pair += 1
+        try:
+            curses.init_pair(pair_id, fg, bg)
+        except curses.error:
+            return 0
+        self._pair_cache[key] = pair_id
+        return pair_id
+
+    def _ansi_attr(self, sgr_codes: str, current: int) -> int:
+        if not sgr_codes:
+            sgr_codes = "0"
+        parts = [int(p) if p else 0 for p in sgr_codes.split(";")]
+        # State: (bold, fg, bg) packed into local vars for this line render call.
+        bold = bool(current & curses.A_BOLD)
+        fg = -1
+        bg = -1
+        for code in parts:
+            if code == 0:
+                bold = False
+                fg = -1
+                bg = -1
+            elif code == 1:
+                bold = True
+            elif code in (22,):
+                bold = False
+            elif 30 <= code <= 37:
+                fg = code - 30
+            elif code == 39:
+                fg = -1
+            elif 40 <= code <= 47:
+                bg = code - 40
+            elif code == 49:
+                bg = -1
+            elif 90 <= code <= 97:
+                fg = (code - 90) + 8
+            elif 100 <= code <= 107:
+                bg = (code - 100) + 8
+        attr = curses.A_NORMAL
+        if bold:
+            attr |= curses.A_BOLD
+        pair = self._pair_for(fg, bg)
+        if pair:
+            attr |= curses.color_pair(pair)
+        return attr
+
+    def _draw_ansi_line(self, y: int, x: int, width: int, line: str) -> int:
+        if width <= 1:
+            return 0
+        csi = re.compile(r"\x1b\[([0-?]*)([ -/]*)([@-~])")
+        col = 0
+        attr = curses.A_NORMAL
+        pos = 0
+        for m in csi.finditer(line):
+            chunk = line[pos : m.start()]
+            if chunk and col < width - 1:
+                drawn = chunk[: max(0, width - 1 - col)]
+                self.stdscr.addnstr(y, x + col, drawn, width - 1 - col, attr)
+                col += len(drawn)
+            final = m.group(3)
+            if final == "m":
+                attr = self._ansi_attr(m.group(1), attr)
+            pos = m.end()
+            if col >= width - 1:
+                break
+        if col < width - 1 and pos < len(line):
+            chunk = line[pos:]
+            drawn = chunk[: max(0, width - 1 - col)]
+            self.stdscr.addnstr(y, x + col, drawn, width - 1 - col, attr)
+            col += len(drawn)
+        return col
+
+    def _measure_ansi_line(self, width: int, line: str) -> int:
+        if width <= 1:
+            return 0
+        csi = re.compile(r"\x1b\[([0-?]*)([ -/]*)([@-~])")
+        col = 0
+        pos = 0
+        for m in csi.finditer(line):
+            chunk = line[pos : m.start()]
+            col += len(chunk)
+            pos = m.end()
+            if col >= width - 1:
+                return width - 1
+        col += len(line[pos:])
+        return min(col, width - 1)
 
     def _send_to_shell(self, key: int) -> bool:
         if self.shell_fd is None:
@@ -395,11 +508,23 @@ class RexApp:
         self._draw_entries(2, 0, split - 2, left_w)
 
         self.stdscr.addnstr(split + 1, 0, f"{shell_focus} Shell (TAB to switch focus)", w - 1, curses.A_UNDERLINE)
-        self._draw_shell(split + 2, 0, h - split - 4, w)
+        cursor_pos = self._draw_shell(split + 2, 0, h - split - 4, w)
 
         footer = "q quit | enter open/dir | e edit | o view | : cmd | s shell focus | tab toggle"
         self.stdscr.addnstr(h - 2, 0, footer, w - 1, curses.A_DIM)
         self.stdscr.addnstr(h - 1, 0, self.message, w - 1, curses.A_BOLD)
+        if self.focus == "shell" and cursor_pos is not None:
+            cy, cx = cursor_pos
+            try:
+                curses.curs_set(1)
+            except curses.error:
+                pass
+            self.stdscr.move(cy, cx)
+        else:
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
         self.stdscr.refresh()
 
     def _draw_entries(self, y: int, x: int, height: int, width: int) -> None:
@@ -414,16 +539,26 @@ class RexApp:
             attr = curses.A_REVERSE if idx == self.selected and self.focus == "browser" else curses.A_NORMAL
             self.stdscr.addnstr(y + i, x, line, width - 1, attr)
 
-    def _draw_shell(self, y: int, x: int, height: int, width: int) -> None:
+    def _draw_shell(self, y: int, x: int, height: int, width: int) -> tuple[int, int] | None:
         if height <= 0 or width <= 1:
-            return
+            return None
 
         lines = self.shell_lines[-height:]
-        start = y + max(0, height - len(lines))
+        start = y
+        cursor_y = start + max(0, min(height - 1, len(lines)))
+        cursor_x = x
         for i, line in enumerate(lines):
-            self.stdscr.addnstr(start + i, x, line, width - 1)
+            self._draw_ansi_line(start + i, x, width, line)
         if self._shell_partial and len(lines) < height:
-            self.stdscr.addnstr(start + len(lines), x, self._shell_partial, width - 1)
+            cursor_y = start + len(lines)
+            col = self._draw_ansi_line(cursor_y, x, width, self._shell_partial)
+            cursor_x = x + min(col, width - 2)
+        elif lines:
+            last_y = start + len(lines) - 1
+            col = self._measure_ansi_line(width, lines[-1])
+            cursor_y = last_y
+            cursor_x = x + min(col, width - 2)
+        return (cursor_y, cursor_x)
 
 
 def _check_ssh_available() -> None:

@@ -2,13 +2,14 @@
 
 `rex` is a terminal UI remote explorer over SSH.
 
-## Features (v0.1)
+## Features (v0.2)
 
 - Browse remote files/directories.
 - Enter/leave directories.
 - View files remotely (`o`).
 - Edit files remotely with `$EDITOR` (`e`).
 - Embedded SSH shell pane (focus with `TAB` or `s`).
+- Shell pane supports ANSI color rendering and shows a cursor when shell has focus.
 - Run one-off command in current remote directory (`:`).
 
 ## Install
@@ -47,3 +48,7 @@ rex user@host /var/log
 ```bash
 ./scripts/smoke.sh
 ```
+
+## Release Notes
+
+See `CHANGELOG.md` for release history.
