@@ -2,6 +2,14 @@
 
 All notable changes to `rex` are documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- Hardened remote edit command construction to avoid raw shell interpolation from `VISUAL`/`EDITOR`.
+- Added fallback to `vi` when `VISUAL`/`EDITOR` cannot be parsed safely.
+- Added regression tests for editor command quoting behavior.
+
 ## [0.2] - 2026-02-14
 
 ### Added

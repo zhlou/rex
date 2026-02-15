@@ -41,6 +41,8 @@ rex user@host /var/log
 ## Notes
 
 - SSH auth is delegated to system `ssh` (keys, agent, passwords, and `~/.ssh/config`).
+- Remote edit command (`e`) uses `VISUAL` first, then `EDITOR`, and safely shell-quotes editor arguments before execution.
+- If `VISUAL`/`EDITOR` is invalid shell syntax, rex falls back to `vi`.
 - Target platforms: macOS and Linux.
 
 ## Smoke Test
