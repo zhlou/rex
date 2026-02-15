@@ -181,8 +181,15 @@ class RexApp:
         self._run_fullscreen_ssh(cmd)
 
     def _edit_file(self, filename: str) -> None:
-        editor = os.environ.get("EDITOR", "vi")
-        cmd = f"cd -- {shlex.quote(self.cwd)} && {editor} -- {shlex.quote(filename)}"
+        editor_value = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+        try:
+            editor_argv = shlex.split(editor_value)
+        except ValueError:
+            editor_argv = ["vi"]
+        if not editor_argv:
+            editor_argv = ["vi"]
+        editor_cmd = " ".join(shlex.quote(arg) for arg in editor_argv)
+        cmd = f"cd -- {shlex.quote(self.cwd)} && {editor_cmd} -- {shlex.quote(filename)}"
         self._run_fullscreen_ssh(cmd)
 
     def _run_fullscreen_ssh(self, remote_command: str) -> None:
