@@ -9,9 +9,8 @@
 - Enter/leave directories.
 - View files remotely (`o`).
 - Edit files remotely with `$EDITOR` (`e`).
-- Embedded SSH shell pane (focus with `TAB` or `s`).
-- Shell pane supports ANSI color rendering and shows a cursor when shell has focus.
-- Run one-off command in current remote directory (`:`).
+- On-demand **Run Command** panel (press `s` or `:` to open).
+- Run commands in the current remote directory and view output inline.
 
 ## Install
 
@@ -33,10 +32,14 @@ rex user@host /var/log
 - `p`: go to parent directory
 - `e`: edit selected file remotely via `$EDITOR`
 - `o`: open selected file in remote pager (`less`/`cat`)
-- `:`: run one command in current remote directory
-- `s`: focus shell pane
-- `TAB`: toggle focus between browser and shell
-- In shell focus: type directly into remote shell, `b` to return to browser
+- `s` or `:`: open **Run Command** panel (bottom quarter) in current browser `cwd`
+- In command panel:
+- Type/edit command locally (`Left/Right/Home/End`, `Backspace`, `Delete`, `Ctrl-U`)
+- `Up/Down` for command history
+- `Enter` to run command remotely
+- `PgUp/PgDn` to page output
+- `/` then `Enter` to search output, `n`/`N` for next/previous match
+- `Esc` to dismiss pane (or cancel search input while searching)
 - `q`: quit
 
 ## Notes
