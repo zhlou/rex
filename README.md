@@ -5,6 +5,7 @@
 ## Features (v0.2)
 
 - Browse remote files/directories.
+- Browser view automatically uses multiple columns when terminal width allows.
 - Enter/leave directories.
 - View files remotely (`o`).
 - Edit files remotely with `$EDITOR` (`e`).
@@ -27,9 +28,9 @@ rex user@host /var/log
 
 ## Controls
 
-- `j`/`k` or arrow keys: move selection
-- `Enter`/`l`: enter directory or open file
-- `h`: go to parent directory
+- `h`/`j`/`k`/`l` or arrow keys: move selection (left/down/up/right)
+- `Enter`: enter directory or open file
+- `p`: go to parent directory
 - `e`: edit selected file remotely via `$EDITOR`
 - `o`: open selected file in remote pager (`less`/`cat`)
 - `:`: run one command in current remote directory
