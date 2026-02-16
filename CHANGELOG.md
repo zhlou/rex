@@ -4,11 +4,21 @@ All notable changes to `rex` are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Browser pane now lays out file entries across multiple columns based on content width and terminal width.
+
+### Changed
+
+- Browser navigation now supports full directional movement with `h`/`j`/`k`/`l` and arrow keys.
+- Parent directory navigation key changed from `h` to `p`.
+
 ### Fixed
 
 - Hardened remote edit command construction to avoid raw shell interpolation from `VISUAL`/`EDITOR`.
 - Added fallback to `vi` when `VISUAL`/`EDITOR` cannot be parsed safely.
 - Added regression tests for editor command quoting behavior.
+- Browser selection movement now stays aligned with rendered row/column position and scrolls across pages correctly.
 
 ## [0.2] - 2026-02-14
 

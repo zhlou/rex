@@ -139,6 +139,28 @@ class RexApp:
             return
         self.selected = max(0, min(len(self.entries) - 1, self.selected + delta))
 
+    def _move_selection_grid(self, d_row: int, d_col: int) -> None:
+        if not self.entries:
+            return
+
+        browser_h, browser_w = self._browser_pane_dimensions()
+        rows, _, _, _ = self._browser_layout(browser_h, browser_w)
+        if rows <= 0:
+            return
+
+        delta = d_row + (d_col * rows)
+        if delta == 0:
+            return
+        target = self.selected + delta
+        if target < 0 or target >= len(self.entries):
+            return
+        self.selected = target
+
+    def _browser_pane_dimensions(self) -> tuple[int, int]:
+        h, w = self.stdscr.getmaxyx()
+        split = h // 2
+        return max(1, split - 2), max(30, w // 2)
+
     def _enter_selected(self) -> None:
         entry = self._current_entry()
         if entry is None:
@@ -458,16 +480,20 @@ class RexApp:
             return True
 
         if key in (curses.KEY_UP, ord("k")):
-            self._move_selection(-1)
+            self._move_selection_grid(-1, 0)
         elif key in (curses.KEY_DOWN, ord("j")):
-            self._move_selection(1)
+            self._move_selection_grid(1, 0)
+        elif key in (curses.KEY_LEFT, ord("h")):
+            self._move_selection_grid(0, -1)
+        elif key in (curses.KEY_RIGHT, ord("l")):
+            self._move_selection_grid(0, 1)
         elif key in (curses.KEY_NPAGE,):
             self._move_selection(10)
         elif key in (curses.KEY_PPAGE,):
             self._move_selection(-10)
-        elif key in (curses.KEY_ENTER, 10, 13, ord("l")):
+        elif key in (curses.KEY_ENTER, 10, 13):
             self._enter_selected()
-        elif key in (ord("h"),):
+        elif key in (ord("p"),):
             if not self._change_directory(str(PurePosixPath(self.cwd).parent) or "/"):
                 self.message = "Error: failed to change to parent directory"
         elif key in (ord("r"),):
@@ -489,13 +515,34 @@ class RexApp:
         return True
 
     def _ensure_visible(self) -> None:
-        h, _ = self.stdscr.getmaxyx()
-        list_height = max(3, h // 2 - 3)
+        browser_h, browser_w = self._browser_pane_dimensions()
+        _, _, _, page_size = self._browser_layout(browser_h, browser_w)
+        if page_size <= 0:
+            return
 
-        if self.selected < self.top_index:
-            self.top_index = self.selected
-        if self.selected >= self.top_index + list_height:
-            self.top_index = self.selected - list_height + 1
+        if self.selected < self.top_index or self.selected >= self.top_index + page_size:
+            self.top_index = (self.selected // page_size) * page_size
+        max_start = 0
+        if self.entries:
+            max_start = ((len(self.entries) - 1) // page_size) * page_size
+        self.top_index = min(self.top_index, max_start)
+
+    def _browser_layout(self, height: int, width: int) -> tuple[int, int, int, int]:
+        rows = max(1, height)
+        usable_width = max(1, width - 1)
+
+        max_label = 2
+        for entry in self.entries:
+            marker = 1 if entry.is_dir else 0
+            max_label = max(max_label, len(entry.name) + marker)
+
+        # Add 2 chars of spacing between columns, then fit as many as the pane allows.
+        column_width = max(4, min(usable_width, max_label + 2))
+        cols = max(1, usable_width // column_width)
+        if cols > 1:
+            column_width = max(4, usable_width // cols)
+        page_size = rows * cols
+        return rows, column_width, cols, page_size
 
     def _draw(self) -> None:
         self.stdscr.erase()
@@ -517,7 +564,7 @@ class RexApp:
         self.stdscr.addnstr(split + 1, 0, f"{shell_focus} Shell (TAB to switch focus)", w - 1, curses.A_UNDERLINE)
         cursor_pos = self._draw_shell(split + 2, 0, h - split - 4, w)
 
-        footer = "q quit | enter open/dir | e edit | o view | : cmd | s shell focus | tab toggle"
+        footer = "q quit | arrows/hjkl move | enter open/dir | p parent | e edit | o view | : cmd | s shell | tab toggle"
         self.stdscr.addnstr(h - 2, 0, footer, w - 1, curses.A_DIM)
         self.stdscr.addnstr(h - 1, 0, self.message, w - 1, curses.A_BOLD)
         if self.focus == "shell" and cursor_pos is not None:
@@ -538,13 +585,19 @@ class RexApp:
         if height <= 0 or width <= 1:
             return
 
-        visible = self.entries[self.top_index : self.top_index + height]
+        rows, column_width, _, page_size = self._browser_layout(height, width)
+        visible = self.entries[self.top_index : self.top_index + page_size]
         for i, entry in enumerate(visible):
             idx = self.top_index + i
+            row = i % rows
+            col = i // rows
+            draw_x = x + col * column_width
+            if draw_x >= x + width - 1:
+                continue
             marker = "/" if entry.is_dir else ""
             line = f"{entry.name}{marker}"
             attr = curses.A_REVERSE if idx == self.selected and self.focus == "browser" else curses.A_NORMAL
-            self.stdscr.addnstr(y + i, x, line, width - 1, attr)
+            self.stdscr.addnstr(y + row, draw_x, line, max(1, column_width - 1), attr)
 
     def _draw_shell(self, y: int, x: int, height: int, width: int) -> tuple[int, int] | None:
         if height <= 0 or width <= 1:
