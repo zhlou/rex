@@ -2,15 +2,9 @@ from __future__ import annotations
 
 import argparse
 import curses
-import errno
-import fcntl
 import locale
 import os
-import pty
-import re
-import select
 import shlex
-import signal
 import subprocess
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -28,7 +22,7 @@ class RemoteEntry:
 
 
 class RexApp:
-    def __init__(self, stdscr: curses.window, host: str, start_path: str = ".") -> None:
+    def __init__(self, stdscr: curses.window | None, host: str, start_path: str = ".") -> None:
         self.stdscr = stdscr
         self.host = host
         self.cwd = self._normalize_remote_path(start_path)
@@ -36,46 +30,41 @@ class RexApp:
         self.selected = 0
         self.top_index = 0
         self.message = ""
-        self.focus = "browser"  # browser | shell
+        self.focus = "browser"  # browser | command
 
-        self.shell_pid: int | None = None
-        self.shell_fd: int | None = None
-        self.shell_lines: List[str] = []
-        self.max_shell_lines = 2000
-        self._shell_partial = ""
-        self._pair_cache: dict[tuple[int, int], int] = {}
-        self._next_pair = 1
-        self._supports_color = False
+        self.command_visible = False
+        self.command_input = ""
+        self.command_cursor = 0
+        self.command_lines: List[str] = []
+        self.max_command_lines = 2000
+        self.command_history: List[str] = []
+        self.command_history_index: int | None = None
+        self._history_stash = ""
+        self.command_scroll = 0
+        self.command_search_mode = False
+        self.command_search_query = ""
+        self.command_search_matches: List[int] = []
+        self.command_search_pos = -1
 
     def run(self) -> None:
+        if self.stdscr is None:
+            raise RuntimeError("stdscr is required to run RexApp")
+
         curses.curs_set(0)
         self.stdscr.nodelay(True)
         self.stdscr.timeout(50)
         self.stdscr.keypad(True)
-        if curses.has_colors():
-            curses.start_color()
-            try:
-                curses.use_default_colors()
-            except curses.error:
-                pass
-            self._supports_color = True
-
-        self._start_shell()
         self._reload_entries()
 
-        try:
-            while True:
-                self._drain_shell_output()
-                self._draw()
-                key = self.stdscr.getch()
-                if key == -1:
-                    continue
-                if not self._handle_key(key):
-                    break
-        finally:
-            self._stop_shell()
+        while True:
+            self._draw()
+            key = self.stdscr.getch()
+            if key == -1:
+                continue
+            if not self._handle_key(key):
+                break
 
-    def _run_ssh(self, command: str, timeout: int = 15) -> subprocess.CompletedProcess[str]:
+    def _run_ssh(self, command: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["ssh", self.host, build_remote_sh_command(command)],
             check=False,
@@ -85,7 +74,6 @@ class RexApp:
         )
 
     def _list_remote_dir(self, target_path: str) -> tuple[str | None, List[RemoteEntry] | None, str | None]:
-        # Print physical cwd first so we can keep browser state synced to what remote shell resolved.
         cmd = f"cd -- {shlex.quote(target_path)} && pwd -P && LC_ALL=C ls -1Ap"
         try:
             result = self._run_ssh(cmd)
@@ -156,10 +144,19 @@ class RexApp:
             return
         self.selected = target
 
+    def _command_block_height(self, total_height: int) -> int:
+        return max(3, total_height // 4)
+
     def _browser_pane_dimensions(self) -> tuple[int, int]:
+        if self.stdscr is None:
+            return 1, 1
         h, w = self.stdscr.getmaxyx()
-        split = h // 2
-        return max(1, split - 2), max(30, w // 2)
+        content_h = max(1, h - 3)
+        browser_h = content_h
+        if self.command_visible:
+            command_h = min(content_h - 1, self._command_block_height(content_h))
+            browser_h = max(1, content_h - command_h)
+        return max(1, browser_h - 1), max(1, w)
 
     def _enter_selected(self) -> None:
         entry = self._current_entry()
@@ -215,6 +212,10 @@ class RexApp:
         self._run_fullscreen_ssh(cmd)
 
     def _run_fullscreen_ssh(self, remote_command: str) -> None:
+        if self.stdscr is None:
+            subprocess.run(["ssh", "-t", self.host, build_remote_sh_command(remote_command)], check=False)
+            return
+
         curses.def_prog_mode()
         curses.endwin()
         try:
@@ -227,257 +228,264 @@ class RexApp:
             self.stdscr.keypad(True)
             self._reload_entries()
 
-    def _prompt(self, label: str) -> str | None:
-        h, w = self.stdscr.getmaxyx()
-        win = curses.newwin(1, w, h - 1, 0)
-        win.erase()
-        win.addstr(0, 0, label[: max(0, w - 1)])
-        curses.echo()
-        curses.curs_set(1)
-        self.stdscr.nodelay(False)
-        self.stdscr.timeout(-1)
-        try:
-            text = win.getstr(0, min(len(label), max(0, w - 1)), max(0, w - len(label) - 1))
-            return text.decode("utf-8", errors="ignore").strip()
-        except curses.error:
-            return None
-        finally:
-            curses.noecho()
-            curses.curs_set(0)
-            self.stdscr.nodelay(True)
-            self.stdscr.timeout(50)
+    def _show_command_panel(self) -> None:
+        self.command_visible = True
+        self.focus = "command"
+        self.command_history_index = None
+        self._history_stash = ""
+        self.command_input = ""
+        self.command_cursor = 0
+        self.command_lines.clear()
+        self.command_scroll = 0
+        self.command_search_mode = False
+        self.command_search_query = ""
+        self.command_search_matches = []
+        self.command_search_pos = -1
+        self.message = f"Run command in {self.cwd}"
 
-    def _run_oneoff_command(self) -> None:
-        user_cmd = self._prompt("Run in cwd> ")
+    def _hide_command_panel(self) -> None:
+        self.focus = "browser"
+        self.command_visible = False
+        self.command_history_index = None
+        self._history_stash = ""
+        self.command_search_mode = False
+
+    def _append_command_line(self, line: str) -> None:
+        was_bottom = self.command_scroll == 0
+        self.command_lines.append(line)
+        if len(self.command_lines) > self.max_command_lines:
+            self.command_lines = self.command_lines[-self.max_command_lines :]
+        if was_bottom:
+            self.command_scroll = 0
+        self._refresh_search_matches()
+
+    def _execute_command_input(self) -> None:
+        user_cmd = self.command_input.strip()
         if not user_cmd:
-            self.message = "Cancelled"
+            self.message = "Empty command"
             return
 
-        cmd = f"cd -- {shlex.quote(self.cwd)} && {user_cmd}"
-        self._run_fullscreen_ssh(cmd)
-        self.message = "Command finished"
+        if not self.command_history or self.command_history[-1] != user_cmd:
+            self.command_history.append(user_cmd)
+        self.command_history_index = None
+        self._history_stash = ""
 
-    def _start_shell(self) -> None:
-        if self.shell_fd is not None:
-            return
-
-        pid, fd = pty.fork()
-        if pid == 0:
-            shell = os.environ.get("SHELL", "/bin/sh")
-            cmd = f"cd -- {shlex.quote(self.cwd)} && exec $SHELL -l"
-            os.execvp("ssh", ["ssh", "-tt", self.host, build_remote_sh_command(cmd)])
-
-        self.shell_pid = pid
-        self.shell_fd = fd
-        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-
-    def _restart_shell(self) -> None:
-        self._stop_shell()
-        self.shell_lines.clear()
-        self._shell_partial = ""
-        self._start_shell()
-
-    def _stop_shell(self) -> None:
-        if self.shell_fd is not None:
-            try:
-                os.close(self.shell_fd)
-            except OSError:
-                pass
-            self.shell_fd = None
-
-        if self.shell_pid is not None:
-            try:
-                os.kill(self.shell_pid, signal.SIGTERM)
-            except OSError as e:
-                if e.errno != errno.ESRCH:
-                    raise
-            self.shell_pid = None
-
-    def _drain_shell_output(self) -> None:
-        if self.shell_fd is None:
-            return
-
-        while True:
-            rlist, _, _ = select.select([self.shell_fd], [], [], 0)
-            if not rlist:
-                break
-            try:
-                data = os.read(self.shell_fd, 4096)
-            except BlockingIOError:
-                break
-            except OSError:
-                self.message = "Shell disconnected"
-                self._restart_shell()
-                return
-            if not data:
-                self.message = "Shell exited, restarting"
-                self._restart_shell()
-                return
-            self._append_shell_data(data.decode("utf-8", errors="replace"))
-
-    def _append_shell_data(self, text: str) -> None:
-        data = self._sanitize_shell_text(self._shell_partial + text)
-        parts = data.split("\n")
-        self._shell_partial = parts.pop() if parts else ""
-        self.shell_lines.extend(parts)
-
-        if len(self.shell_lines) > self.max_shell_lines:
-            self.shell_lines = self.shell_lines[-self.max_shell_lines :]
-
-    def _sanitize_shell_text(self, text: str) -> str:
-        # Keep CSI for SGR rendering, but remove OSC sequences.
-        text = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", text)
-        # Normalize CRLF and treat bare CR as line overwrite boundary.
-        text = text.replace("\r\n", "\n").replace("\r", "\n")
-        return text
-
-    def _pair_for(self, fg: int, bg: int) -> int:
-        if not self._supports_color:
-            return 0
-        key = (fg, bg)
-        if key in self._pair_cache:
-            return self._pair_cache[key]
-        if self._next_pair >= curses.COLOR_PAIRS:
-            return 0
-        pair_id = self._next_pair
-        self._next_pair += 1
+        self._append_command_line(f"$ {user_cmd}")
+        remote = f"cd -- {shlex.quote(self.cwd)} && {user_cmd}"
+        self.command_scroll = 0
         try:
-            curses.init_pair(pair_id, fg, bg)
-        except curses.error:
+            result = self._run_ssh(remote, timeout=60)
+        except subprocess.TimeoutExpired:
+            self._append_command_line("[timed out]")
+            self.message = "Command timed out"
+            self.command_input = ""
+            self.command_cursor = 0
+            return
+
+        out_lines = result.stdout.splitlines()
+        err_lines = result.stderr.splitlines()
+        if not out_lines and not err_lines:
+            self._append_command_line("[no output]")
+        else:
+            for line in out_lines:
+                self._append_command_line(line)
+            for line in err_lines:
+                self._append_command_line(f"stderr: {line}")
+
+        if result.returncode != 0:
+            self._append_command_line(f"[exit {result.returncode}]")
+            self.message = f"Command failed ({result.returncode})"
+        else:
+            self.message = "Command finished"
+
+        self.command_input = ""
+        self.command_cursor = 0
+
+    def _command_output_rows(self) -> int:
+        if self.stdscr is None or not self.command_visible:
             return 0
-        self._pair_cache[key] = pair_id
-        return pair_id
+        h, _ = self.stdscr.getmaxyx()
+        content_h = max(1, h - 3)
+        command_block_h = min(content_h - 1, self._command_block_height(content_h))
+        panel_h = max(1, command_block_h - 1)
+        return max(0, panel_h - 1)
 
-    def _ansi_attr(self, sgr_codes: str, current: int) -> int:
-        if not sgr_codes:
-            sgr_codes = "0"
-        parts = [int(p) if p else 0 for p in sgr_codes.split(";")]
-        # State: (bold, fg, bg) packed into local vars for this line render call.
-        bold = bool(current & curses.A_BOLD)
-        fg = -1
-        bg = -1
-        for code in parts:
-            if code == 0:
-                bold = False
-                fg = -1
-                bg = -1
-            elif code == 1:
-                bold = True
-            elif code in (22,):
-                bold = False
-            elif 30 <= code <= 37:
-                fg = code - 30
-            elif code == 39:
-                fg = -1
-            elif 40 <= code <= 47:
-                bg = code - 40
-            elif code == 49:
-                bg = -1
-            elif 90 <= code <= 97:
-                fg = (code - 90) + 8
-            elif 100 <= code <= 107:
-                bg = (code - 100) + 8
-        attr = curses.A_NORMAL
-        if bold:
-            attr |= curses.A_BOLD
-        pair = self._pair_for(fg, bg)
-        if pair:
-            attr |= curses.color_pair(pair)
-        return attr
-
-    def _draw_ansi_line(self, y: int, x: int, width: int, line: str) -> int:
-        if width <= 1:
+    def _command_max_scroll(self) -> int:
+        output_rows = self._command_output_rows()
+        if output_rows <= 0:
             return 0
-        csi = re.compile(r"\x1b\[([0-?]*)([ -/]*)([@-~])")
-        col = 0
-        attr = curses.A_NORMAL
-        pos = 0
-        for m in csi.finditer(line):
-            chunk = line[pos : m.start()]
-            if chunk and col < width - 1:
-                drawn = chunk[: max(0, width - 1 - col)]
-                self.stdscr.addnstr(y, x + col, drawn, width - 1 - col, attr)
-                col += len(drawn)
-            final = m.group(3)
-            if final == "m":
-                attr = self._ansi_attr(m.group(1), attr)
-            pos = m.end()
-            if col >= width - 1:
-                break
-        if col < width - 1 and pos < len(line):
-            chunk = line[pos:]
-            drawn = chunk[: max(0, width - 1 - col)]
-            self.stdscr.addnstr(y, x + col, drawn, width - 1 - col, attr)
-            col += len(drawn)
-        return col
+        return max(0, len(self.command_lines) - output_rows)
 
-    def _measure_ansi_line(self, width: int, line: str) -> int:
-        if width <= 1:
-            return 0
-        csi = re.compile(r"\x1b\[([0-?]*)([ -/]*)([@-~])")
-        col = 0
-        pos = 0
-        for m in csi.finditer(line):
-            chunk = line[pos : m.start()]
-            col += len(chunk)
-            pos = m.end()
-            if col >= width - 1:
-                return width - 1
-        col += len(line[pos:])
-        return min(col, width - 1)
+    def _clamp_command_scroll(self) -> None:
+        self.command_scroll = max(0, min(self.command_scroll, self._command_max_scroll()))
 
-    def _send_to_shell(self, key: int) -> bool:
-        if self.shell_fd is None:
-            return False
+    def _refresh_search_matches(self) -> None:
+        query = self.command_search_query.strip().lower()
+        if not query:
+            self.command_search_matches = []
+            self.command_search_pos = -1
+            return
+        self.command_search_matches = [i for i, line in enumerate(self.command_lines) if query in line.lower()]
+        if not self.command_search_matches:
+            self.command_search_pos = -1
+        elif self.command_search_pos < 0 or self.command_search_pos >= len(self.command_search_matches):
+            self.command_search_pos = 0
 
-        mapping = {
-            curses.KEY_UP: b"\x1b[A",
-            curses.KEY_DOWN: b"\x1b[B",
-            curses.KEY_RIGHT: b"\x1b[C",
-            curses.KEY_LEFT: b"\x1b[D",
-            curses.KEY_BACKSPACE: b"\x7f",
-            10: b"\n",
-            13: b"\n",
-            9: b"\t",
-            27: b"\x1b",
-        }
+    def _scroll_to_line(self, line_idx: int) -> None:
+        output_rows = self._command_output_rows()
+        if output_rows <= 0:
+            self.command_scroll = 0
+            return
+        total = len(self.command_lines)
+        line_idx = max(0, min(total - 1, line_idx))
+        desired_start = max(0, line_idx - (output_rows // 2))
+        desired_end = min(total, desired_start + output_rows)
+        desired_start = max(0, desired_end - output_rows)
+        self.command_scroll = max(0, total - desired_end)
+        self._clamp_command_scroll()
 
-        if key in mapping:
-            os.write(self.shell_fd, mapping[key])
+    def _jump_search(self, direction: int) -> None:
+        if not self.command_search_matches:
+            self.message = "No search matches"
+            return
+        if self.command_search_pos < 0:
+            self.command_search_pos = 0 if direction >= 0 else len(self.command_search_matches) - 1
+        else:
+            self.command_search_pos = (self.command_search_pos + direction) % len(self.command_search_matches)
+        line_idx = self.command_search_matches[self.command_search_pos]
+        self._scroll_to_line(line_idx)
+        self.message = (
+            f"Match {self.command_search_pos + 1}/{len(self.command_search_matches)}"
+            f" for '{self.command_search_query}'"
+        )
+
+    def _handle_search_key(self, key: int) -> bool:
+        if key in (27,):  # ESC
+            self.command_search_mode = False
+            self.message = "Search cancelled"
             return True
-
-        if 0 <= key <= 255:
-            os.write(self.shell_fd, bytes([key]))
+        if key in (curses.KEY_ENTER, 10, 13):
+            self.command_search_mode = False
+            self._refresh_search_matches()
+            if not self.command_search_matches:
+                self.message = f"No matches for '{self.command_search_query}'"
+                return True
+            self.command_search_pos = -1
+            self._jump_search(1)
             return True
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            if self.command_search_query:
+                self.command_search_query = self.command_search_query[:-1]
+            return True
+        if key == 21:  # Ctrl-u
+            self.command_search_query = ""
+            return True
+        if 32 <= key <= 126:
+            self.command_search_query += chr(key)
+            return True
+        return True
 
-        return False
+    def _set_command_from_history(self, direction: int) -> None:
+        if not self.command_history:
+            return
+
+        if self.command_history_index is None:
+            self._history_stash = self.command_input
+            self.command_history_index = len(self.command_history)
+
+        next_idx = self.command_history_index + direction
+        next_idx = max(0, min(len(self.command_history), next_idx))
+        self.command_history_index = next_idx
+
+        if self.command_history_index == len(self.command_history):
+            self.command_input = self._history_stash
+        else:
+            self.command_input = self.command_history[self.command_history_index]
+        self.command_cursor = len(self.command_input)
+
+    def _handle_command_key(self, key: int) -> bool:
+        if self.command_search_mode:
+            return self._handle_search_key(key)
+
+        if key in (27, 29):  # ESC, Ctrl-]
+            self._hide_command_panel()
+            return True
+        if key in (ord("/"),):
+            self.command_search_mode = True
+            self.message = "Search output (/ then Enter, ESC cancel, n/N navigate)"
+            return True
+        if key in (ord("n"),):
+            self._refresh_search_matches()
+            self._jump_search(1)
+            return True
+        if key in (ord("N"),):
+            self._refresh_search_matches()
+            self._jump_search(-1)
+            return True
+        if key in (curses.KEY_PPAGE,):
+            step = max(1, self._command_output_rows())
+            self.command_scroll += step
+            self._clamp_command_scroll()
+            return True
+        if key in (curses.KEY_NPAGE,):
+            step = max(1, self._command_output_rows())
+            self.command_scroll -= step
+            self._clamp_command_scroll()
+            return True
+        if key in (curses.KEY_ENTER, 10, 13):
+            self._execute_command_input()
+            return True
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            if self.command_cursor > 0:
+                self.command_input = (
+                    self.command_input[: self.command_cursor - 1] + self.command_input[self.command_cursor :]
+                )
+                self.command_cursor -= 1
+            return True
+        if key in (curses.KEY_DC,):
+            if self.command_cursor < len(self.command_input):
+                self.command_input = (
+                    self.command_input[: self.command_cursor] + self.command_input[self.command_cursor + 1 :]
+                )
+            return True
+        if key in (curses.KEY_LEFT,):
+            self.command_cursor = max(0, self.command_cursor - 1)
+            return True
+        if key in (curses.KEY_RIGHT,):
+            self.command_cursor = min(len(self.command_input), self.command_cursor + 1)
+            return True
+        if key in (curses.KEY_HOME,):
+            self.command_cursor = 0
+            return True
+        if key in (curses.KEY_END,):
+            self.command_cursor = len(self.command_input)
+            return True
+        if key in (curses.KEY_UP,):
+            self._set_command_from_history(-1)
+            return True
+        if key in (curses.KEY_DOWN,):
+            self._set_command_from_history(1)
+            return True
+        if key == 21:  # Ctrl-u
+            self.command_input = self.command_input[self.command_cursor :]
+            self.command_cursor = 0
+            return True
+        if 32 <= key <= 126:
+            ch = chr(key)
+            self.command_input = self.command_input[: self.command_cursor] + ch + self.command_input[self.command_cursor :]
+            self.command_cursor += 1
+            return True
+        return True
 
     def _handle_key(self, key: int) -> bool:
         if key in (ord("q"), ord("Q")):
             return False
 
-        if key in (ord("\t"),):
-            self.focus = "shell" if self.focus == "browser" else "browser"
-            return True
-
         if key in (curses.KEY_RESIZE,):
             return True
 
-        if self.focus == "shell":
-            if key in (curses.KEY_ENTER, 10, 13):
-                self.message = "Enter sent to shell (shell focus). Press TAB/b for browser focus."
-                self._send_to_shell(key)
-                return True
-            if key in (ord("r"), ord("R")):
-                self._restart_shell()
-                self.message = "Shell restarted"
-                return True
-            if key in (ord("b"), ord("B")):
-                self.focus = "browser"
-                return True
-            self._send_to_shell(key)
-            return True
+        if self.focus == "command":
+            return self._handle_command_key(key)
 
         if key in (curses.KEY_UP, ord("k")):
             self._move_selection_grid(-1, 0)
@@ -506,10 +514,8 @@ class RexApp:
             entry = self._current_entry()
             if entry and not entry.is_dir and entry.name != "..":
                 self._open_file(entry.name)
-        elif key in (ord(":"),):
-            self._run_oneoff_command()
-        elif key in (ord("s"),):
-            self.focus = "shell"
+        elif key in (ord(":"), ord("s"), ord("S")):
+            self._show_command_panel()
 
         self._ensure_visible()
         return True
@@ -536,7 +542,6 @@ class RexApp:
             marker = 1 if entry.is_dir else 0
             max_label = max(max_label, len(entry.name) + marker)
 
-        # Add 2 chars of spacing between columns, then fit as many as the pane allows.
         column_width = max(4, min(usable_width, max_label + 2))
         cols = max(1, usable_width // column_width)
         if cols > 1:
@@ -545,29 +550,49 @@ class RexApp:
         return rows, column_width, cols, page_size
 
     def _draw(self) -> None:
+        if self.stdscr is None:
+            return
+
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
-        left_w = max(30, w // 2)
 
         browser_focus = "*" if self.focus == "browser" else " "
-        shell_focus = "*" if self.focus == "shell" else " "
+        command_focus = "*" if self.focus == "command" else " "
 
         header = f"{browser_focus} rex  host={self.host}  cwd={self.cwd}"
         self.stdscr.addnstr(0, 0, header, w - 1, curses.A_BOLD)
 
-        split = h // 2
-        self.stdscr.hline(split, 0, ord("-"), w)
+        content_h = max(1, h - 3)
+        browser_block_h = content_h
+        command_block_h = 0
+        if self.command_visible:
+            command_block_h = min(content_h - 1, self._command_block_height(content_h))
+            browser_block_h = max(1, content_h - command_block_h)
 
-        self.stdscr.addnstr(1, 0, "Files", left_w - 1, curses.A_UNDERLINE)
-        self._draw_entries(2, 0, split - 2, left_w)
+        self.stdscr.addnstr(1, 0, "Files", w - 1, curses.A_UNDERLINE)
+        self._draw_entries(2, 0, max(1, browser_block_h - 1), w)
 
-        self.stdscr.addnstr(split + 1, 0, f"{shell_focus} Shell (TAB to switch focus)", w - 1, curses.A_UNDERLINE)
-        cursor_pos = self._draw_shell(split + 2, 0, h - split - 4, w)
+        cursor_pos = None
+        if self.command_visible:
+            panel_title_y = 1 + browser_block_h
+            self.stdscr.hline(panel_title_y - 1, 0, ord("-"), w)
+            self.stdscr.addnstr(
+                panel_title_y,
+                0,
+                f"{command_focus} Run Command (Enter run | PgUp/PgDn scroll | / search | Esc dismiss)",
+                w - 1,
+                curses.A_UNDERLINE,
+            )
+            cursor_pos = self._draw_command_panel(panel_title_y + 1, 0, max(1, command_block_h - 1), w)
 
-        footer = "q quit | arrows/hjkl move | enter open/dir | p parent | e edit | o view | : cmd | s shell | tab toggle"
+        footer = (
+            "q quit | arrows/hjkl move | enter open/dir | p parent | e edit | o view | "
+            "s/: run command | pgup/pgdn scroll | / search"
+        )
         self.stdscr.addnstr(h - 2, 0, footer, w - 1, curses.A_DIM)
         self.stdscr.addnstr(h - 1, 0, self.message, w - 1, curses.A_BOLD)
-        if self.focus == "shell" and cursor_pos is not None:
+
+        if self.focus == "command" and cursor_pos is not None:
             cy, cx = cursor_pos
             try:
                 curses.curs_set(1)
@@ -579,10 +604,11 @@ class RexApp:
                 curses.curs_set(0)
             except curses.error:
                 pass
+
         self.stdscr.refresh()
 
     def _draw_entries(self, y: int, x: int, height: int, width: int) -> None:
-        if height <= 0 or width <= 1:
+        if self.stdscr is None or height <= 0 or width <= 1:
             return
 
         rows, column_width, _, page_size = self._browser_layout(height, width)
@@ -599,26 +625,38 @@ class RexApp:
             attr = curses.A_REVERSE if idx == self.selected and self.focus == "browser" else curses.A_NORMAL
             self.stdscr.addnstr(y + row, draw_x, line, max(1, column_width - 1), attr)
 
-    def _draw_shell(self, y: int, x: int, height: int, width: int) -> tuple[int, int] | None:
-        if height <= 0 or width <= 1:
+    def _draw_command_panel(self, y: int, x: int, height: int, width: int) -> tuple[int, int] | None:
+        if self.stdscr is None or height <= 0 or width <= 1:
             return None
 
-        lines = self.shell_lines[-height:]
-        start = y
-        cursor_y = start + max(0, min(height - 1, len(lines)))
-        cursor_x = x
+        output_rows = max(0, height - 1)
+        self._clamp_command_scroll()
+        if output_rows > 0:
+            end = max(0, len(self.command_lines) - self.command_scroll)
+            start = max(0, end - output_rows)
+            lines = self.command_lines[start:end]
+        else:
+            lines = []
         for i, line in enumerate(lines):
-            self._draw_ansi_line(start + i, x, width, line)
-        if self._shell_partial and len(lines) < height:
-            cursor_y = start + len(lines)
-            col = self._draw_ansi_line(cursor_y, x, width, self._shell_partial)
-            cursor_x = x + min(col, width - 2)
-        elif lines:
-            last_y = start + len(lines) - 1
-            col = self._measure_ansi_line(width, lines[-1])
-            cursor_y = last_y
-            cursor_x = x + min(col, width - 2)
-        return (cursor_y, cursor_x)
+            self.stdscr.addnstr(y + i, x, line, width - 1)
+
+        input_y = y + max(0, height - 1)
+        prompt = "/ " if self.command_search_mode else "> "
+        prompt_w = len(prompt)
+        avail = max(0, width - 1 - prompt_w)
+        text = self.command_search_query if self.command_search_mode else self.command_input
+        cursor = len(text) if self.command_search_mode else self.command_cursor
+
+        scroll = 0
+        if cursor > avail:
+            scroll = cursor - avail
+        visible_input = text[scroll : scroll + avail]
+
+        self.stdscr.addnstr(input_y, x, prompt, width - 1, curses.A_BOLD)
+        self.stdscr.addnstr(input_y, x + prompt_w, visible_input, max(0, width - 1 - prompt_w))
+        cursor_x = x + prompt_w + min(max(0, cursor - scroll), max(0, avail))
+        cursor_x = min(cursor_x, x + width - 2)
+        return (input_y, cursor_x)
 
 
 def _check_ssh_available() -> None:

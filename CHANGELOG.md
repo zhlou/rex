@@ -12,6 +12,11 @@ All notable changes to `rex` are documented in this file.
 
 - Browser navigation now supports full directional movement with `h`/`j`/`k`/`l` and arrow keys.
 - Parent directory navigation key changed from `h` to `p`.
+- Replaced the interactive shell pane with a local-edit **Run Command** panel.
+- Run Command panel opens on demand with `s` or `:`, renders in the bottom quarter, and runs in browser `cwd`.
+- Run Command panel supports local line editing, history navigation, and `Esc` to dismiss.
+- Added command output paging with `PgUp/PgDn` in Run Command panel.
+- Added command output search with `/` + `Enter`, and `n`/`N` navigation between matches.
 
 ### Fixed
 
