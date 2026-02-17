@@ -6,7 +6,7 @@ import locale
 import os
 import shlex
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import List
 
@@ -21,9 +21,99 @@ class RemoteEntry:
     is_dir: bool
 
 
+@dataclass
+class CommandPanelState:
+    visible: bool = False
+    input: str = ""
+    cursor: int = 0
+    lines: List[str] = field(default_factory=list)
+    max_lines: int = 2000
+    history: List[str] = field(default_factory=list)
+    history_index: int | None = None
+    history_stash: str = ""
+    scroll: int = 0
+    search_mode: bool = False
+    search_query: str = ""
+    search_matches: List[int] = field(default_factory=list)
+    search_pos: int = -1
+
+    def reset_for_open(self) -> None:
+        self.visible = True
+        self.input = ""
+        self.cursor = 0
+        self.lines.clear()
+        self.scroll = 0
+        self.history_index = None
+        self.history_stash = ""
+        self.search_mode = False
+        self.search_query = ""
+        self.search_matches = []
+        self.search_pos = -1
+
+    def close(self) -> None:
+        self.visible = False
+        self.history_index = None
+        self.history_stash = ""
+        self.search_mode = False
+
+    def append_line(self, line: str) -> None:
+        was_bottom = self.scroll == 0
+        self.lines.append(line)
+        if len(self.lines) > self.max_lines:
+            self.lines = self.lines[-self.max_lines :]
+        if was_bottom:
+            self.scroll = 0
+
+    def clear_input(self) -> None:
+        self.input = ""
+        self.cursor = 0
+
+
+class RemoteShell:
+    def __init__(self, host: str) -> None:
+        self.host = host
+
+    def run(self, command: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["ssh", self.host, build_remote_sh_command(command)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+    def run_fullscreen(self, remote_command: str) -> None:
+        subprocess.run(["ssh", "-t", self.host, build_remote_sh_command(remote_command)], check=False)
+
+    def list_directory(self, target_path: str) -> tuple[str | None, List[RemoteEntry] | None, str | None]:
+        cmd = f"cd -- {shlex.quote(target_path)} && pwd -P && LC_ALL=C ls -1Ap"
+        try:
+            result = self.run(cmd)
+        except subprocess.TimeoutExpired:
+            return None, None, "Listing timed out"
+
+        if result.returncode != 0:
+            err = result.stderr.strip() or "failed to list directory"
+            return None, None, f"Error: {err}"
+
+        lines = result.stdout.splitlines()
+        if not lines:
+            return None, None, "Error: empty response while listing directory"
+
+        resolved_cwd = lines[0].strip() or target_path
+        raw = [line for line in lines[1:] if line]
+        parsed: List[RemoteEntry] = [RemoteEntry("..", True)]
+        for item in raw:
+            is_dir = item.endswith("/")
+            name = item[:-1] if is_dir else item
+            parsed.append(RemoteEntry(name=name, is_dir=is_dir))
+        return resolved_cwd, parsed, None
+
+
 class RexApp:
     def __init__(self, stdscr: curses.window | None, host: str, start_path: str = ".") -> None:
         self.stdscr = stdscr
+        self.remote = RemoteShell(host)
         self.host = host
         self.cwd = self._normalize_remote_path(start_path)
         self.entries: List[RemoteEntry] = []
@@ -31,20 +121,7 @@ class RexApp:
         self.top_index = 0
         self.message = ""
         self.focus = "browser"  # browser | command
-
-        self.command_visible = False
-        self.command_input = ""
-        self.command_cursor = 0
-        self.command_lines: List[str] = []
-        self.max_command_lines = 2000
-        self.command_history: List[str] = []
-        self.command_history_index: int | None = None
-        self._history_stash = ""
-        self.command_scroll = 0
-        self.command_search_mode = False
-        self.command_search_query = ""
-        self.command_search_matches: List[int] = []
-        self.command_search_pos = -1
+        self.command = CommandPanelState()
 
     def run(self) -> None:
         if self.stdscr is None:
@@ -64,42 +141,8 @@ class RexApp:
             if not self._handle_key(key):
                 break
 
-    def _run_ssh(self, command: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["ssh", self.host, build_remote_sh_command(command)],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-
-    def _list_remote_dir(self, target_path: str) -> tuple[str | None, List[RemoteEntry] | None, str | None]:
-        cmd = f"cd -- {shlex.quote(target_path)} && pwd -P && LC_ALL=C ls -1Ap"
-        try:
-            result = self._run_ssh(cmd)
-        except subprocess.TimeoutExpired:
-            return None, None, "Listing timed out"
-
-        if result.returncode != 0:
-            err = result.stderr.strip() or "failed to list directory"
-            return None, None, f"Error: {err}"
-
-        lines = result.stdout.splitlines()
-        if not lines:
-            return None, None, "Error: empty response while listing directory"
-
-        resolved_cwd = lines[0].strip() or target_path
-        raw = [line for line in lines[1:] if line]
-        parsed: List[RemoteEntry] = [RemoteEntry("..", True)]
-        for item in raw:
-            is_dir = item.endswith("/")
-            name = item[:-1] if is_dir else item
-            parsed.append(RemoteEntry(name=name, is_dir=is_dir))
-
-        return resolved_cwd, parsed, None
-
     def _reload_entries(self) -> None:
-        resolved_cwd, parsed, err = self._list_remote_dir(self.cwd)
+        resolved_cwd, parsed, err = self.remote.list_directory(self.cwd)
         if err is not None or parsed is None or resolved_cwd is None:
             self.message = err or "Error: failed to list directory"
             return
@@ -153,7 +196,7 @@ class RexApp:
         h, w = self.stdscr.getmaxyx()
         content_h = max(1, h - 3)
         browser_h = content_h
-        if self.command_visible:
+        if self.command.visible:
             command_h = min(content_h - 1, self._command_block_height(content_h))
             browser_h = max(1, content_h - command_h)
         return max(1, browser_h - 1), max(1, w)
@@ -176,7 +219,7 @@ class RexApp:
 
     def _change_directory(self, target_path: str) -> bool:
         old_cwd = self.cwd
-        resolved_cwd, parsed, err = self._list_remote_dir(target_path)
+        resolved_cwd, parsed, err = self.remote.list_directory(target_path)
         if err is not None or parsed is None or resolved_cwd is None:
             self.message = err or "Failed to change directory"
             return False
@@ -213,13 +256,13 @@ class RexApp:
 
     def _run_fullscreen_ssh(self, remote_command: str) -> None:
         if self.stdscr is None:
-            subprocess.run(["ssh", "-t", self.host, build_remote_sh_command(remote_command)], check=False)
+            self.remote.run_fullscreen(remote_command)
             return
 
         curses.def_prog_mode()
         curses.endwin()
         try:
-            subprocess.run(["ssh", "-t", self.host, build_remote_sh_command(remote_command)], check=False)
+            self.remote.run_fullscreen(remote_command)
         finally:
             curses.reset_prog_mode()
             curses.curs_set(0)
@@ -229,57 +272,38 @@ class RexApp:
             self._reload_entries()
 
     def _show_command_panel(self) -> None:
-        self.command_visible = True
+        self.command.reset_for_open()
         self.focus = "command"
-        self.command_history_index = None
-        self._history_stash = ""
-        self.command_input = ""
-        self.command_cursor = 0
-        self.command_lines.clear()
-        self.command_scroll = 0
-        self.command_search_mode = False
-        self.command_search_query = ""
-        self.command_search_matches = []
-        self.command_search_pos = -1
         self.message = f"Run command in {self.cwd}"
 
     def _hide_command_panel(self) -> None:
         self.focus = "browser"
-        self.command_visible = False
-        self.command_history_index = None
-        self._history_stash = ""
-        self.command_search_mode = False
+        self.command.close()
 
     def _append_command_line(self, line: str) -> None:
-        was_bottom = self.command_scroll == 0
-        self.command_lines.append(line)
-        if len(self.command_lines) > self.max_command_lines:
-            self.command_lines = self.command_lines[-self.max_command_lines :]
-        if was_bottom:
-            self.command_scroll = 0
+        self.command.append_line(line)
         self._refresh_search_matches()
 
     def _execute_command_input(self) -> None:
-        user_cmd = self.command_input.strip()
+        user_cmd = self.command.input.strip()
         if not user_cmd:
             self.message = "Empty command"
             return
 
-        if not self.command_history or self.command_history[-1] != user_cmd:
-            self.command_history.append(user_cmd)
-        self.command_history_index = None
-        self._history_stash = ""
+        if not self.command.history or self.command.history[-1] != user_cmd:
+            self.command.history.append(user_cmd)
+        self.command.history_index = None
+        self.command.history_stash = ""
 
         self._append_command_line(f"$ {user_cmd}")
         remote = f"cd -- {shlex.quote(self.cwd)} && {user_cmd}"
-        self.command_scroll = 0
+        self.command.scroll = 0
         try:
-            result = self._run_ssh(remote, timeout=60)
+            result = self.remote.run(remote, timeout=60)
         except subprocess.TimeoutExpired:
             self._append_command_line("[timed out]")
             self.message = "Command timed out"
-            self.command_input = ""
-            self.command_cursor = 0
+            self.command.clear_input()
             return
 
         out_lines = result.stdout.splitlines()
@@ -298,11 +322,10 @@ class RexApp:
         else:
             self.message = "Command finished"
 
-        self.command_input = ""
-        self.command_cursor = 0
+        self.command.clear_input()
 
     def _command_output_rows(self) -> int:
-        if self.stdscr is None or not self.command_visible:
+        if self.stdscr is None or not self.command.visible:
             return 0
         h, _ = self.stdscr.getmaxyx()
         content_h = max(1, h - 3)
@@ -314,104 +337,104 @@ class RexApp:
         output_rows = self._command_output_rows()
         if output_rows <= 0:
             return 0
-        return max(0, len(self.command_lines) - output_rows)
+        return max(0, len(self.command.lines) - output_rows)
 
     def _clamp_command_scroll(self) -> None:
-        self.command_scroll = max(0, min(self.command_scroll, self._command_max_scroll()))
+        self.command.scroll = max(0, min(self.command.scroll, self._command_max_scroll()))
 
     def _refresh_search_matches(self) -> None:
-        query = self.command_search_query.strip().lower()
+        query = self.command.search_query.strip().lower()
         if not query:
-            self.command_search_matches = []
-            self.command_search_pos = -1
+            self.command.search_matches = []
+            self.command.search_pos = -1
             return
-        self.command_search_matches = [i for i, line in enumerate(self.command_lines) if query in line.lower()]
-        if not self.command_search_matches:
-            self.command_search_pos = -1
-        elif self.command_search_pos < 0 or self.command_search_pos >= len(self.command_search_matches):
-            self.command_search_pos = 0
+        self.command.search_matches = [i for i, line in enumerate(self.command.lines) if query in line.lower()]
+        if not self.command.search_matches:
+            self.command.search_pos = -1
+        elif self.command.search_pos < 0 or self.command.search_pos >= len(self.command.search_matches):
+            self.command.search_pos = 0
 
     def _scroll_to_line(self, line_idx: int) -> None:
         output_rows = self._command_output_rows()
         if output_rows <= 0:
-            self.command_scroll = 0
+            self.command.scroll = 0
             return
-        total = len(self.command_lines)
+        total = len(self.command.lines)
         line_idx = max(0, min(total - 1, line_idx))
         desired_start = max(0, line_idx - (output_rows // 2))
         desired_end = min(total, desired_start + output_rows)
         desired_start = max(0, desired_end - output_rows)
-        self.command_scroll = max(0, total - desired_end)
+        self.command.scroll = max(0, total - desired_end)
         self._clamp_command_scroll()
 
     def _jump_search(self, direction: int) -> None:
-        if not self.command_search_matches:
+        if not self.command.search_matches:
             self.message = "No search matches"
             return
-        if self.command_search_pos < 0:
-            self.command_search_pos = 0 if direction >= 0 else len(self.command_search_matches) - 1
+        if self.command.search_pos < 0:
+            self.command.search_pos = 0 if direction >= 0 else len(self.command.search_matches) - 1
         else:
-            self.command_search_pos = (self.command_search_pos + direction) % len(self.command_search_matches)
-        line_idx = self.command_search_matches[self.command_search_pos]
+            self.command.search_pos = (self.command.search_pos + direction) % len(self.command.search_matches)
+        line_idx = self.command.search_matches[self.command.search_pos]
         self._scroll_to_line(line_idx)
         self.message = (
-            f"Match {self.command_search_pos + 1}/{len(self.command_search_matches)}"
-            f" for '{self.command_search_query}'"
+            f"Match {self.command.search_pos + 1}/{len(self.command.search_matches)}"
+            f" for '{self.command.search_query}'"
         )
 
     def _handle_search_key(self, key: int) -> bool:
         if key in (27,):  # ESC
-            self.command_search_mode = False
+            self.command.search_mode = False
             self.message = "Search cancelled"
             return True
         if key in (curses.KEY_ENTER, 10, 13):
-            self.command_search_mode = False
+            self.command.search_mode = False
             self._refresh_search_matches()
-            if not self.command_search_matches:
-                self.message = f"No matches for '{self.command_search_query}'"
+            if not self.command.search_matches:
+                self.message = f"No matches for '{self.command.search_query}'"
                 return True
-            self.command_search_pos = -1
+            self.command.search_pos = -1
             self._jump_search(1)
             return True
         if key in (curses.KEY_BACKSPACE, 127, 8):
-            if self.command_search_query:
-                self.command_search_query = self.command_search_query[:-1]
+            if self.command.search_query:
+                self.command.search_query = self.command.search_query[:-1]
             return True
         if key == 21:  # Ctrl-u
-            self.command_search_query = ""
+            self.command.search_query = ""
             return True
         if 32 <= key <= 126:
-            self.command_search_query += chr(key)
+            self.command.search_query += chr(key)
             return True
         return True
 
     def _set_command_from_history(self, direction: int) -> None:
-        if not self.command_history:
+        if not self.command.history:
             return
 
-        if self.command_history_index is None:
-            self._history_stash = self.command_input
-            self.command_history_index = len(self.command_history)
+        if self.command.history_index is None:
+            self.command.history_stash = self.command.input
+            self.command.history_index = len(self.command.history)
 
-        next_idx = self.command_history_index + direction
-        next_idx = max(0, min(len(self.command_history), next_idx))
-        self.command_history_index = next_idx
+        next_idx = self.command.history_index + direction
+        next_idx = max(0, min(len(self.command.history), next_idx))
+        self.command.history_index = next_idx
 
-        if self.command_history_index == len(self.command_history):
-            self.command_input = self._history_stash
+        if self.command.history_index == len(self.command.history):
+            self.command.input = self.command.history_stash
         else:
-            self.command_input = self.command_history[self.command_history_index]
-        self.command_cursor = len(self.command_input)
+            self.command.input = self.command.history[self.command.history_index]
+        self.command.cursor = len(self.command.input)
 
     def _handle_command_key(self, key: int) -> bool:
-        if self.command_search_mode:
+        if self.command.search_mode:
             return self._handle_search_key(key)
 
         if key in (27, 29):  # ESC, Ctrl-]
             self._hide_command_panel()
             return True
         if key in (ord("/"),):
-            self.command_search_mode = True
+            self.command.search_mode = True
             self.message = "Search output (/ then Enter, ESC cancel, n/N navigate)"
             return True
         if key in (ord("n"),):
@@ -424,41 +447,41 @@ class RexApp:
             return True
         if key in (curses.KEY_PPAGE,):
             step = max(1, self._command_output_rows())
-            self.command_scroll += step
+            self.command.scroll += step
             self._clamp_command_scroll()
             return True
         if key in (curses.KEY_NPAGE,):
             step = max(1, self._command_output_rows())
-            self.command_scroll -= step
+            self.command.scroll -= step
             self._clamp_command_scroll()
             return True
         if key in (curses.KEY_ENTER, 10, 13):
             self._execute_command_input()
             return True
         if key in (curses.KEY_BACKSPACE, 127, 8):
-            if self.command_cursor > 0:
-                self.command_input = (
-                    self.command_input[: self.command_cursor - 1] + self.command_input[self.command_cursor :]
+            if self.command.cursor > 0:
+                self.command.input = (
+                    self.command.input[: self.command.cursor - 1] + self.command.input[self.command.cursor :]
                 )
-                self.command_cursor -= 1
+                self.command.cursor -= 1
             return True
         if key in (curses.KEY_DC,):
-            if self.command_cursor < len(self.command_input):
-                self.command_input = (
-                    self.command_input[: self.command_cursor] + self.command_input[self.command_cursor + 1 :]
+            if self.command.cursor < len(self.command.input):
+                self.command.input = (
+                    self.command.input[: self.command.cursor] + self.command.input[self.command.cursor + 1 :]
                 )
             return True
         if key in (curses.KEY_LEFT,):
-            self.command_cursor = max(0, self.command_cursor - 1)
+            self.command.cursor = max(0, self.command.cursor - 1)
             return True
         if key in (curses.KEY_RIGHT,):
-            self.command_cursor = min(len(self.command_input), self.command_cursor + 1)
+            self.command.cursor = min(len(self.command.input), self.command.cursor + 1)
             return True
         if key in (curses.KEY_HOME,):
-            self.command_cursor = 0
+            self.command.cursor = 0
             return True
         if key in (curses.KEY_END,):
-            self.command_cursor = len(self.command_input)
+            self.command.cursor = len(self.command.input)
             return True
         if key in (curses.KEY_UP,):
             self._set_command_from_history(-1)
@@ -467,13 +490,13 @@ class RexApp:
             self._set_command_from_history(1)
             return True
         if key == 21:  # Ctrl-u
-            self.command_input = self.command_input[self.command_cursor :]
-            self.command_cursor = 0
+            self.command.input = self.command.input[self.command.cursor :]
+            self.command.cursor = 0
             return True
         if 32 <= key <= 126:
             ch = chr(key)
-            self.command_input = self.command_input[: self.command_cursor] + ch + self.command_input[self.command_cursor :]
-            self.command_cursor += 1
+            self.command.input = self.command.input[: self.command.cursor] + ch + self.command.input[self.command.cursor :]
+            self.command.cursor += 1
             return True
         return True
 
@@ -565,7 +588,7 @@ class RexApp:
         content_h = max(1, h - 3)
         browser_block_h = content_h
         command_block_h = 0
-        if self.command_visible:
+        if self.command.visible:
             command_block_h = min(content_h - 1, self._command_block_height(content_h))
             browser_block_h = max(1, content_h - command_block_h)
 
@@ -573,7 +596,7 @@ class RexApp:
         self._draw_entries(2, 0, max(1, browser_block_h - 1), w)
 
         cursor_pos = None
-        if self.command_visible:
+        if self.command.visible:
             panel_title_y = 1 + browser_block_h
             self.stdscr.hline(panel_title_y - 1, 0, ord("-"), w)
             self.stdscr.addnstr(
@@ -632,20 +655,20 @@ class RexApp:
         output_rows = max(0, height - 1)
         self._clamp_command_scroll()
         if output_rows > 0:
-            end = max(0, len(self.command_lines) - self.command_scroll)
+            end = max(0, len(self.command.lines) - self.command.scroll)
             start = max(0, end - output_rows)
-            lines = self.command_lines[start:end]
+            lines = self.command.lines[start:end]
         else:
             lines = []
         for i, line in enumerate(lines):
             self.stdscr.addnstr(y + i, x, line, width - 1)
 
         input_y = y + max(0, height - 1)
-        prompt = "/ " if self.command_search_mode else "> "
+        prompt = "/ " if self.command.search_mode else "> "
         prompt_w = len(prompt)
         avail = max(0, width - 1 - prompt_w)
-        text = self.command_search_query if self.command_search_mode else self.command_input
-        cursor = len(text) if self.command_search_mode else self.command_cursor
+        text = self.command.search_query if self.command.search_mode else self.command.input
+        cursor = len(text) if self.command.search_mode else self.command.cursor
 
         scroll = 0
         if cursor > avail:
